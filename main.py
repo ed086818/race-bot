@@ -3,6 +3,7 @@ import logging
 import os
 
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 
@@ -19,6 +20,17 @@ async def start(message: Message):
 async def main():
     logging.basicConfig(level=logging.INFO)
     bot = Bot(token=TOKEN)
+
+    # Ждём, пока Telegram снимет лимит, вместо падения и перезапуска
+    while True:
+        try:
+            me = await bot.get_me()
+            logging.info("Подключён как @%s", me.username)
+            break
+        except TelegramRetryAfter as e:
+            logging.warning("Лимит Telegram, ждём %s сек...", e.retry_after)
+            await asyncio.sleep(e.retry_after + 5)
+
     await dp.start_polling(bot)
 
 
