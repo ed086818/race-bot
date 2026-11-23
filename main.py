@@ -147,7 +147,18 @@ async def cmd_list(message: types.Message):
 
 async def main():
     await init_db()
-    await dp.start_polling(bot)
+    while True:
+        try:
+            await dp.start_polling(bot)
+        except TelegramRetryAfter as e:
+            # Telegram просит подождать — ждём и пробуем снова
+            print(f"Лимит запросов, ждём {e.retry_after} сек...")
+            await asyncio.sleep(e.retry_after + 1)
+        except Exception as e:
+            # Любая другая ошибка — ждём и перезапускаемся
+            print(f"Ошибка: {e}. Перезапуск через 10 сек...")
+            await asyncio.sleep(10)
 
 if __name__ == "__main__":
     asyncio.run(main())
+
