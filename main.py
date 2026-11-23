@@ -7,7 +7,9 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise SystemExit("Не найден токен: задайте BOT_TOKEN")
 
 dp = Dispatcher()
 
@@ -21,7 +23,6 @@ async def main():
     logging.basicConfig(level=logging.INFO)
     bot = Bot(token=TOKEN)
 
-    # Ждём, пока Telegram снимет лимит, вместо падения и перезапуска
     while True:
         try:
             me = await bot.get_me()
