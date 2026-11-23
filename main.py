@@ -26,6 +26,7 @@ import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -480,10 +481,21 @@ async def main() -> None:
     dp = Dispatcher()  # FSM по умолчанию хранится в памяти
     dp.include_router(router)
 
-    # aiogram сам переживает временные сетевые ошибки и лимиты Telegram,
-    # поэтому свой цикл перезапуска не нужен.
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    try:
+        # Снимаем старый webhook (если был). При лимите Telegram ждём и повторяем,
+        # а не падаем — иначе перезапуски только продлевают блокировку.
+        while True:
+            try:
+                await bot.delete_webhook(drop_pending_updates=True)
+                break
+            except TelegramRetryAfter as e:
+                logging.warning("Лимит Telegram, ждём %s сек...", e.retry_after)
+                await asyncio.sleep(e.retry_after + 1)
+
+        # Дальше aiogram сам переживает сетевые ошибки и лимиты.
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":
