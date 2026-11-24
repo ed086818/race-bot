@@ -374,7 +374,8 @@ async def cmd_top(message: Message):
     for i, row in enumerate(rows, 1):
         name = f"@{row['username']}" if row["username"] else row["full_name"]
         medal = medals.get(i, f"{i}.")
-        lines.append(f"{medal} <b>{row['time_display']}</b> — {row['car']}\n     {name}")
+        # Более заметное разделение между результатами
+        lines.append(f"{medal} <b>{row['time_display']}</b> — {row['car']}\n👤 {name}\n")
 
     await message.answer("\n".join(lines), parse_mode="HTML")
 
@@ -391,7 +392,7 @@ async def cmd_my(message: Message):
     for i, row in enumerate(rows, 1):
         lines.append(f"{i}. <b>{row['time_display']}</b> — {row['car']}")
 
-    await message.answer("\n".join(lines), parse_mode="HTML")
+n    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("cars"))
