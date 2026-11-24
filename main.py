@@ -39,7 +39,6 @@ async def start_health_server():
     runner = web.AppRunner(app)
     await runner.setup()
 
-    # Airlok и большинство PaaS смотрят на PORT
     port = int(os.getenv("PORT", os.getenv("WEB_PORT", 8080)))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
@@ -49,17 +48,19 @@ async def start_health_server():
 async def main():
     bot = Bot(token=TOKEN)
 
-    # Удаляем возможный старый webhook
+    # Пытаемся удалить webhook, но не падаем и не ждём при лимитах
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook удалён (если был)")
+    except TelegramRetryAfter as e:
+        logger.warning("Лимит при удалении webhook (ждём не будем): %s сек", e.retry_after)
     except Exception as e:
         logger.warning("Не удалось удалить webhook: %s", e)
 
-    # Запускаем health-check сервер
+    # Сразу запускаем health-check
     await start_health_server()
 
-    # Пробуем подключиться к Telegram
+    # Подключаемся к Telegram
     while True:
         try:
             me = await bot.get_me()
@@ -67,16 +68,15 @@ async def main():
             break
         except TelegramUnauthorizedError:
             logger.error("Неверный токен бота (Unauthorized). Проверьте BOT_TOKEN.")
-            await asyncio.sleep(30)
+            await asyncio.sleep(60)
         except TelegramRetryAfter as e:
-            wait = e.retry_after + 5
-            logger.warning("Лимит Telegram, ждём %s сек...", wait)
+            wait = min(e.retry_after + 5, 60)  # максимум 60 сек за раз
+            logger trans.warning("Лимит Telegram, ждём %s сек...", wait)
             await asyncio.sleep(wait)
         except Exception as e:
             logger.error("Ошибка при подключении: %s", e)
-            await asyncio.sleep(10)
+            await asyncio.sleep(15)
 
-    # Запускаем polling
     logger.info("Запускаю polling...")
     await dp.start_polling(bot)
 
