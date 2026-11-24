@@ -25,7 +25,8 @@ TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     raise SystemExit("Не найден токен: задайте переменную окружения BOT_TOKEN")
 
-DB_PATH = os.getenv("DB_PATH", "racebot.db")
+# На Airlok и большинстве PaaS пишем базу в /tmp
+DB_PATH = os.getenv("DB_PATH", "/tmp/racebot.db")
 TRACK = "Nürburgring"
 
 storage = MemoryStorage()
@@ -107,7 +108,7 @@ async def init_db():
             )
         """)
         await db.commit()
-    logger.info("База данных инициализирована")
+    logger.info("База данных инициализирована: %s", DB_PATH)
 
 
 async def get_or_create_user(telegram_id: int, username: str | None, full_name: str):
