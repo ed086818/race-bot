@@ -71,7 +71,7 @@ async def main():
             await asyncio.sleep(60)
         except TelegramRetryAfter as e:
             wait = min(e.retry_after + 5, 60)  # максимум 60 сек за раз
-            logger trans.warning("Лимит Telegram, ждём %s сек...", wait)
+            logger.warning("Лимит Telegram, ждём %s сек...", wait)
             await asyncio.sleep(wait)
         except Exception as e:
             logger.error("Ошибка при подключении: %s", e)
