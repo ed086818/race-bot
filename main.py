@@ -32,7 +32,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise SystemExit("Не найден DATABASE_URL. Включите PostgreSQL в настройках Airlok.")
 
-# Админы (можно добавить через переменную ADMIN_IDS через запятую)
 ADMIN_IDS = {1170169366}
 if os.getenv("ADMIN_IDS"):
     ADMIN_IDS.update(int(x.strip()) for x in os.getenv("ADMIN_IDS").split(",") if x.strip().isdigit())
@@ -65,6 +64,14 @@ class AddResult(StatesGroup):
     waiting_for_car = State()
     waiting_for_time = State()
     confirming_car = State()
+
+
+class EditCar(StatesGroup):
+    choosing_car = State()
+    waiting_photo = State()
+    waiting_power = State()
+    waiting_torque = State()
+    waiting_drivetrain = State()
 
 
 # ==================== Утилиты ====================
@@ -114,9 +121,19 @@ async def init_db():
                 id SERIAL PRIMARY KEY,
                 name_original TEXT NOT NULL,
                 name_normalized TEXT NOT NULL UNIQUE,
+                photo_file_id TEXT,
+                power_hp INTEGER,
+                torque_nm INTEGER,
+                drivetrain TEXT,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
+        # На случай если таблица уже была без новых полей
+        await conn.execute("ALTER TABLE cars ADD COLUMN IF NOT EXISTS photo_file_id TEXT")
+        await conn.execute("ALTER TABLE cars ADD COLUMN IF NOT EXISTS power_hp INTEGER")
+        await conn.execute("ALTER TABLE cars ADD COLUMN IF NOT EXISTS torque_nm INTEGER")
+        await conn.execute("ALTER TABLE cars ADD COLUMN IF NOT EXISTS drivetrain TEXT")
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS results (
                 id SERIAL PRIMARY KEY,
@@ -229,8 +246,30 @@ async def get_all_cars():
         """, TRACK)
 
 
+async def get_car_details(car_id: int):
+    async with pool.acquire() as conn:
+        return await conn.fetchrow("""
+            SELECT c.*, COUNT(r.id) as results_count, MIN(r.time_ms) as best_ms
+            FROM cars c
+            LEFT JOIN results r ON r.car_id = c.id AND r.track = $2
+            WHERE c.id = $1
+            GROUP BY c.id
+        """, car_id, TRACK)
+
+
+async def update_car_info(car_id: int, photo_file_id=None, power_hp=None, torque_nm=None, drivetrain=None):
+    async with pool.acquire() as conn:
+        if photo_file_id is not None:
+            await conn.execute("UPDATE cars SET photo_file_id = $1 WHERE id = $2", photo_file_id, car_id)
+        if power_hp is not None:
+            await conn.execute("UPDATE cars SET power_hp = $1 WHERE id = $2", power_hp, car_id)
+        if torque_nm is not None:
+            await conn.execute("UPDATE cars SET torque_nm = $1 WHERE id = $2", torque_nm, car_id)
+        if drivetrain is not None:
+            await conn.execute("UPDATE cars SET drivetrain = $1 WHERE id = $2", drivetrain, car_id)
+
+
 async def delete_result(result_id: int, user_id: int | None = None) -> bool:
-    """Удаляет результат. Если user_id указан — только свой."""
     async with pool.acquire() as conn:
         if user_id is not None:
             result = await conn.execute(
@@ -246,7 +285,6 @@ async def delete_result(result_id: int, user_id: int | None = None) -> bool:
 
 
 async def delete_car(car_id: int) -> int:
-    """Удаляет машину и все её результаты. Возвращает количество удалённых результатов."""
     async with pool.acquire() as conn:
         res = await conn.execute("DELETE FROM results WHERE car_id = $1", car_id)
         deleted = int(res.split()[-1]) if res.startswith("DELETE") else 0
@@ -273,7 +311,12 @@ async def cmd_start(message: Message):
         "Формат времени: <code>1:23.456</code> или <code>83.456</code>"
     )
     if is_admin(message.from_user.id):
-        text += "\n\n🔧 <b>Админ-команды:</b>\n/delcar — удалить машину\n/delresult — удалить результат по ID"
+        text += (
+            "\n\n🔧 <b>Админ-команды:</b>\n"
+            "/editcar — фото и характеристики машины\n"
+            "/delcar — удалить машину\n"
+            "/delresult — удалить результат по ID"
+        )
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 
@@ -461,14 +504,200 @@ async def cmd_cars(message: Message):
         return
 
     lines = ["🏎 <b>Машины в базе</b>\n"]
+    buttons = []
     for row in rows:
         best = format_time(row["best_ms"]) if row["best_ms"] else "—"
         lines.append(f"• <b>{row['name_original']}</b>\n  {row['count']} рез., лучшее: {best}\n")
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"ℹ️ {row['name_original']}",
+                callback_data=f"car_info:{row['id']}"
+            )
+        ])
 
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    await message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
 
 
-# ==================== Админ-команды ====================
+@dp.callback_query(F.data.startswith("car_info:"))
+async def show_car_info(callback: CallbackQuery):
+    car_id = int(callback.data.split(":")[1])
+    car = await get_car_details(car_id)
+    if not car:
+        await callback.answer("Машина не найдена", show_alert=True)
+        return
+
+    best = format_time(car["best_ms"]) if car["best_ms"] else "—"
+    text = (
+        f"🏎 <b>{car['name_original']}</b>\n\n"
+        f"📊 Результатов: {car['results_count']}\n"
+        f"⏱ Лучшее время: {best}\n\n"
+    )
+    if car["power_hp"]:
+        text += f"⚡ Мощность: {car['power_hp']} л.с.\n"
+    if car["torque_nm"]:
+        text += f"🔧 Момент: {car['torque_nm']} Н·м\n"
+    if car["drivetrain"]:
+        text += f"🔄 Привод: {car['drivetrain']}\n"
+
+    if car["photo_file_id"]:
+        await callback.message.answer_photo(
+            photo=car["photo_file_id"],
+            caption=text,
+            parse_mode="HTML"
+        )
+    else:
+        await callback.message.answer(text, parse_mode="HTML")
+
+    await callback.answer()
+
+
+# ==================== Админ: редактирование машины ====================
+@dp.message(Command("editcar"))
+async def cmd_editcar(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только для администраторов.")
+        return
+
+    rows = await get_all_cars()
+    if not rows:
+        await message.answer("В базе нет машин.")
+        return
+
+    buttons = []
+    for row in rows:
+        buttons.append([
+            InlineKeyboardButton(
+                text=row["name_original"],
+                callback_data=f"editcar_select:{row['id']}"
+            )
+        ])
+
+    await state.set_state(EditCar.choosing_car)
+    await message.answer(
+        "Выбери машину для редактирования:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+@dp.callback_query(F.data.startswith("editcar_select:"))
+async def editcar_selected(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+
+    car_id = int(callback.data.split(":")[1])
+    await state.update_data(edit_car_id=car_id)
+    await state.set_state(EditCar.waiting_photo)
+
+    await callback.message.edit_text(
+        "Отправь <b>фото</b> машины.\n"
+        "Или напиши <code>-</code>, чтобы пропустить.",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.message(EditCar.waiting_photo, F.photo)
+async def editcar_photo(message: Message, state: FSMContext):
+    photo = message.photo[-1]  # самое большое
+    data = await state.get_data()
+    await update_car_info(data["edit_car_id"], photo_file_id=photo.file_id)
+    await state.set_state(EditCar.waiting_power)
+    await message.answer(
+        "✅ Фото сохранено.\n\n"
+        "Теперь введи <b>мощность</b> в л.с. (только число).\n"
+        "Или <code>-</code> чтобы пропустить.",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(EditCar.waiting_photo)
+async def editcar_photo_skip(message: Message, state: FSMContext):
+    if message.text and message.text.strip() == "-":
+        await state.set_state(EditCar.waiting_power)
+        await message.answer(
+            "Фото пропущено.\n\n"
+            "Введи <b>мощность</b> в л.с. (только число).\n"
+            "Или <code>-</code> чтобы пропустить.",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer("Отправь фото или напиши <code>-</code>", parse_mode="HTML")
+
+
+@dp.message(EditCar.waiting_power)
+async def editcar_power(message: Message, state: FSMContext):
+    text = message.text.strip() if message.text else ""
+    data = await state.get_data()
+
+    if text == "-":
+        pass
+    elif text.isdigit():
+        await update_car_info(data["edit_car_id"], power_hp=int(text))
+    else:
+        await message.answer("Введи число или <code>-</code>", parse_mode="HTML")
+        return
+
+    await state.set_state(EditCar.waiting_torque)
+    await message.answer(
+        "Теперь введи <b>крутящий момент</b> в Н·м (только число).\n"
+        "Или <code>-</code> чтобы пропустить.",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(EditCar.waiting_torque)
+async def editcar_torque(message: Message, state: FSMContext):
+    text = message.text.strip() if message.text else ""
+    data = await state.get_data()
+
+    if text == "-":
+        pass
+    elif text.isdigit():
+        await update_car_info(data["edit_car_id"], torque_nm=int(text))
+    else:
+        await message.answer("Введи число или <code>-</code>", parse_mode="HTML")
+        return
+
+    await state.set_state(EditCar.waiting_drivetrain)
+    await message.answer(
+        "Теперь укажи <b>привод</b>:\n"
+        "• FWD — передний\n"
+        "• RWD — задний\n"
+        "• AWD — полный\n\n"
+        "Или <code>-</code> чтобы пропустить.",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(EditCar.waiting_drivetrain)
+async def editcar_drivetrain(message: Message, state: FSMContext):
+    text = (message.text or "").strip().upper()
+    data = await state.get_data()
+
+    if text == "-":
+        pass
+    elif text in ("FWD", "RWD", "AWD"):
+        await update_car_info(data["edit_car_id"], drivetrain=text)
+    else:
+        await message.answer("Напиши FWD, RWD, AWD или <code>-</code>", parse_mode="HTML")
+        return
+
+    await state.clear()
+    car = await get_car_details(data["edit_car_id"])
+    await message.answer(
+        f"✅ Данные машины <b>{car['name_original']}</b> обновлены!\n"
+        "Посмотреть можно через /cars → «Подробнее».",
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard()
+    )
+
+
+# ==================== Админ: удаление ====================
 @dp.message(Command("delresult"))
 async def cmd_delresult(message: Message):
     if not is_admin(message.from_user.id):
@@ -478,8 +707,7 @@ async def cmd_delresult(message: Message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2 or not args[1].strip().isdigit():
         await message.answer(
-            "Использование:\n<code>/delresult ID</code>\n\n"
-            "ID результата можно посмотреть в /my (у себя) или попросить пользователя.",
+            "Использование:\n<code>/delresult ID</code>",
             parse_mode="HTML"
         )
         return
