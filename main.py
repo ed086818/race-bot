@@ -10,7 +10,10 @@ from rapidfuzz import fuzz, process
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramRetryAfter, TelegramUnauthorizedError
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -25,12 +28,23 @@ TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     raise SystemExit("Не найден токен: задайте переменную окружения BOT_TOKEN")
 
-# На Airlok и большинстве PaaS пишем базу в /tmp
 DB_PATH = os.getenv("DB_PATH", "/tmp/racebot.db")
 TRACK = "Nürburgring"
 
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+
+
+# ==================== Клавиатура ====================
+def get_main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="➕ Добавить результат"), KeyboardButton(text="🏆 Топ")],
+            [KeyboardButton(text="📋 Мои результаты"), KeyboardButton(text="🏎 Машины")],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выбери действие или напиши команду"
+    )
 
 
 # ==================== FSM ====================
@@ -42,17 +56,12 @@ class AddResult(StatesGroup):
 
 # ==================== Утилиты ====================
 def normalize_car_name(name: str) -> str:
-    """Приводит название машины к единому виду для сравнения."""
     name = name.lower().strip()
-    name = re.sub(r"[^a-z0-9]", "", name)  # оставляем только буквы и цифры
+    name = re.sub(r"[^a-z0-9]", "", name)
     return name
 
 
 def parse_time(time_str: str) -> int | None:
-    """
-    Парсит время в формате M:SS.mmm или SS.mmm
-    Возвращает миллисекунды или None при ошибке.
-    """
     time_str = time_str.strip().replace(",", ".")
     match = re.match(r"^(?:(\d+):)?(\d{1,2})\.(\d{1,3})$", time_str)
     if not match:
@@ -65,7 +74,6 @@ def parse_time(time_str: str) -> int | None:
 
 
 def format_time(ms: int) -> str:
-    """Форматирует миллисекунды обратно в M:SS.mmm"""
     minutes = ms // 60000
     seconds = (ms % 60000) // 1000
     millis = ms % 1000
@@ -135,7 +143,7 @@ async def find_similar_cars(normalized: str, limit: int = 5):
         choices.keys(),
         scorer=fuzz.ratio,
         limit=limit,
-        score_cutoff=70  # порог похожести
+        score_cutoff=70
     )
     return [(choices[name], score) for name, score, _ in results]
 
@@ -151,7 +159,7 @@ async def get_or_create_car(name_original: str):
             row = await cursor.fetchone()
 
         if row:
-            return row["id"], row["name_original"], False  # уже существовала
+            return row["id"], row["name_original"], False
 
         await db.execute(
             "INSERT INTO cars (name_original, name_normalized, created_at) VALUES (?, ?, ?)",
@@ -160,7 +168,7 @@ async def get_or_create_car(name_original: str):
         await db.commit()
         async with db.execute("SELECT last_insert_rowid()") as cursor:
             car_id = (await cursor.fetchone())[0]
-        return car_id, name_original.strip(), True  # создана новая
+        return car_id, name_original.strip(), True
 
 
 async def add_result(user_id: int, car_id: int, time_ms: int, time_display: str):
@@ -226,24 +234,26 @@ async def cmd_start(message: Message):
     text = (
         f"Привет, {message.from_user.first_name}! 🏁\n\n"
         f"Это бот статистики для <b>{TRACK}</b> (CPM2).\n\n"
-        "Доступные команды:\n"
+        "Используй кнопки внизу или команды:\n"
         "/add — добавить результат\n"
         "/top — общий рейтинг\n"
         "/my — мои результаты\n"
         "/cars — список машин\n\n"
         "Формат времени: <code>1:23.456</code> или <code>83.456</code>"
     )
-    await message.answer(text, parse_mode="HTML")
+    await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 
 @dp.message(Command("add"))
+@dp.message(F.text == "➕ Добавить результат")
 async def cmd_add(message: Message, state: FSMContext):
     await state.set_state(AddResult.waiting_for_car)
     await message.answer(
         "Введи название машины:\n"
         "Пример: <code>Porsche 911 GT3</code>\n\n"
         "Постарайся писать название одинаково, чтобы не создавать дубликаты.",
-        parse_mode="HTML"
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove()
     )
 
 
@@ -256,8 +266,6 @@ async def process_car(message: Message, state: FSMContext):
 
     normalized = normalize_car_name(car_name)
     similar = await find_similar_cars(normalized)
-
-    # Если есть очень похожие (score >= 85) — предлагаем выбрать
     good_matches = [(car, score) for car, score in similar if score >= 85]
 
     if good_matches:
@@ -279,7 +287,6 @@ async def process_car(message: Message, state: FSMContext):
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
         )
     else:
-        # Создаём сразу
         car_id, final_name, is_new = await get_or_create_car(car_name)
         await state.update_data(car_id=car_id, car_name=final_name)
         await state.set_state(AddResult.waiting_for_time)
@@ -353,40 +360,47 @@ async def process_time(message: Message, state: FSMContext):
         f"🏎 <b>{car_name}</b>\n"
         f"⏱ {time_display}\n"
         f"📍 {TRACK}",
-        parse_mode="HTML"
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard()
     )
 
 
 @dp.message(Command("top"))
+@dp.message(F.text == "🏆 Топ")
 async def cmd_top(message: Message):
     rows = await get_top(20)
     if not rows:
-        await message.answer("Пока нет ни одного результата. Будь первым — /add")
+        await message.answer("Пока нет ни одного результата. Будь первым — нажми «➕ Добавить результат»")
         return
 
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     lines = [f"🏆 <b>Топ результатов — {TRACK}</b>\n"]
+
     for i, row in enumerate(rows, 1):
         name = f"@{row['username']}" if row["username"] else row["full_name"]
-        lines.append(f"{i}. {row['time_display']} — {row['car']} ({name})")
+        medal = medals.get(i, f"{i}.")
+        lines.append(f"{medal} <b>{row['time_display']}</b> — {row['car']}\n     {name}")
 
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("my"))
+@dp.message(F.text == "📋 Мои результаты")
 async def cmd_my(message: Message):
     rows = await get_user_results(message.from_user.id)
     if not rows:
-        await message.answer("У тебя пока нет результатов. Добавь первый — /add")
+        await message.answer("У тебя пока нет результатов. Добавь первый — нажми «➕ Добавить результат»")
         return
 
     lines = ["📋 <b>Твои результаты</b>\n"]
     for i, row in enumerate(rows, 1):
-        lines.append(f"{i}. {row['time_display']} — {row['car']}")
+        lines.append(f"{i}. <b>{row['time_display']}</b> — {row['car']}")
 
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("cars"))
+@dp.message(F.text == "🏎 Машины")
 async def cmd_cars(message: Message):
     rows = await get_all_cars()
     if not rows:
@@ -396,7 +410,7 @@ async def cmd_cars(message: Message):
     lines = ["🏎 <b>Машины в базе</b>\n"]
     for row in rows:
         best = format_time(row["best_ms"]) if row["best_ms"] else "—"
-        lines.append(f"• {row['name_original']} — {row['count']} рез., лучшее: {best}")
+        lines.append(f"• <b>{row['name_original']}</b> — {row['count']} рез., лучшее: {best}")
 
     await message.answer("\n".join(lines), parse_mode="HTML")
 
