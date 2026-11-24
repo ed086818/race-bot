@@ -4,7 +4,7 @@ import os
 import re
 from datetime import datetime
 from aiohttp import web
-import aiosqlite
+import asyncpg
 from rapidfuzz import fuzz, process
 
 from aiogram import Bot, Dispatcher, F
@@ -28,8 +28,12 @@ TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     raise SystemExit("Не найден токен: задайте переменную окружения BOT_TOKEN")
 
-DB_PATH = os.getenv("DB_PATH", "/tmp/racebot.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise SystemExit("Не найден DATABASE_URL. Включите PostgreSQL в настройках Airlok.")
+
 TRACK = "Nürburgring"
+pool: asyncpg.Pool | None = None
 
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -82,62 +86,63 @@ def format_time(ms: int) -> str:
     return f"{seconds}.{millis:03d}"
 
 
-# ==================== База данных ====================
+# ==================== База данных (PostgreSQL) ====================
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
+    global pool
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+    async with pool.acquire() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                telegram_id INTEGER PRIMARY KEY,
+                telegram_id BIGINT PRIMARY KEY,
                 username TEXT,
                 full_name TEXT,
-                created_at TEXT
+                created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS cars (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 name_original TEXT NOT NULL,
                 name_normalized TEXT NOT NULL UNIQUE,
-                created_at TEXT
+                created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                car_id INTEGER NOT NULL,
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(telegram_id),
+                car_id INTEGER NOT NULL REFERENCES cars(id),
                 time_ms INTEGER NOT NULL,
                 time_display TEXT NOT NULL,
                 track TEXT NOT NULL,
-                created_at TEXT,
-                updated_at TEXT,
-                FOREIGN KEY (user_id) REFERENCES users (telegram_id),
-                FOREIGN KEY (car_id) REFERENCES cars (id)
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
-        await db.commit()
-    logger.info("База данных инициализирована: %s", DB_PATH)
+    logger.info("PostgreSQL база инициализирована")
 
 
 async def get_or_create_user(telegram_id: int, username: str | None, full_name: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO users (telegram_id, username, full_name, created_at) VALUES (?, ?, ?, ?)",
-            (telegram_id, username, full_name, datetime.utcnow().isoformat())
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (telegram_id, username, full_name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (telegram_id) DO NOTHING
+            """,
+            telegram_id, username, full_name
         )
-        await db.commit()
 
 
 async def find_similar_cars(normalized: str, limit: int = 5):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT id, name_original, name_normalized FROM cars") as cursor:
-            cars = await cursor.fetchall()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, name_original, name_normalized FROM cars")
 
-    if not cars:
+    if not rows:
         return []
 
-    choices = {c["name_normalized"]: c for c in cars}
+    choices = {r["name_normalized"]: r for r in rows}
     results = process.extract(
         normalized,
         choices.keys(),
@@ -150,77 +155,69 @@ async def find_similar_cars(normalized: str, limit: int = 5):
 
 async def get_or_create_car(name_original: str):
     normalized = normalize_car_name(name_original)
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT id, name_original FROM cars WHERE name_normalized = ?",
-            (normalized,)
-        ) as cursor:
-            row = await cursor.fetchone()
-
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, name_original FROM cars WHERE name_normalized = $1",
+            normalized
+        )
         if row:
             return row["id"], row["name_original"], False
 
-        await db.execute(
-            "INSERT INTO cars (name_original, name_normalized, created_at) VALUES (?, ?, ?)",
-            (name_original.strip(), normalized, datetime.utcnow().isoformat())
+        row = await conn.fetchrow(
+            """
+            INSERT INTO cars (name_original, name_normalized)
+            VALUES ($1, $2)
+            RETURNING id, name_original
+            """,
+            name_original.strip(), normalized
         )
-        await db.commit()
-        async with db.execute("SELECT last_insert_rowid()") as cursor:
-            car_id = (await cursor.fetchone())[0]
-        return car_id, name_original.strip(), True
+        return row["id"], row["name_original"], True
 
 
 async def add_result(user_id: int, car_id: int, time_ms: int, time_display: str):
-    now = datetime.utcnow().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """INSERT INTO results (user_id, car_id, time_ms, time_display, track, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (user_id, car_id, time_ms, time_display, TRACK, now, now)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO results (user_id, car_id, time_ms, time_display, track)
+            VALUES ($1, $2, $3, $4, $5)
+            """,
+            user_id, car_id, time_ms, time_display, TRACK
         )
-        await db.commit()
 
 
 async def get_top(limit: int = 15):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("""
+    async with pool.acquire() as conn:
+        return await conn.fetch("""
             SELECT r.time_ms, r.time_display, c.name_original as car, u.username, u.full_name
             FROM results r
             JOIN cars c ON c.id = r.car_id
             JOIN users u ON u.telegram_id = r.user_id
-            WHERE r.track = ?
+            WHERE r.track = $1
             ORDER BY r.time_ms ASC
-            LIMIT ?
-        """, (TRACK, limit)) as cursor:
-            return await cursor.fetchall()
+            LIMIT $2
+        """, TRACK, limit)
 
 
 async def get_user_results(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("""
+    async with pool.acquire() as conn:
+        return await conn.fetch("""
             SELECT r.id, r.time_display, r.time_ms, c.name_original as car, r.created_at
             FROM results r
             JOIN cars c ON c.id = r.car_id
-            WHERE r.user_id = ? AND r.track = ?
+            WHERE r.user_id = $1 AND r.track = $2
             ORDER BY r.time_ms ASC
-        """, (user_id, TRACK)) as cursor:
-            return await cursor.fetchall()
+        """, user_id, TRACK)
 
 
 async def get_all_cars():
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("""
+    async with pool.acquire() as conn:
+        return await conn.fetch("""
             SELECT c.name_original, COUNT(r.id) as count, MIN(r.time_ms) as best_ms
             FROM cars c
-            LEFT JOIN results r ON r.car_id = c.id AND r.track = ?
-            GROUP BY c.id
+            LEFT JOIN results r ON r.car_id = c.id AND r.track = $1
+            GROUP BY c.id, c.name_original
             ORDER BY count DESC, c.name_original
-        """, (TRACK,)) as cursor:
-            return await cursor.fetchall()
+        """, TRACK)
 
 
 # ==================== Хендлеры ====================
@@ -300,10 +297,8 @@ async def process_car(message: Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("use_car:"))
 async def use_existing_car(callback: CallbackQuery, state: FSMContext):
     car_id = int(callback.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT name_original FROM cars WHERE id = ?", (car_id,)) as cursor:
-            row = await cursor.fetchone()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT name_original FROM cars WHERE id = $1", car_id)
     if not row:
         await callback.answer("Машина не найдена", show_alert=True)
         return
