@@ -248,7 +248,6 @@ async def delete_result(result_id: int, user_id: int | None = None) -> bool:
 async def delete_car(car_id: int) -> int:
     """Удаляет машину и все её результаты. Возвращает количество удалённых результатов."""
     async with pool.acquire() as conn:
-        # Сначала удаляем результаты
         res = await conn.execute("DELETE FROM results WHERE car_id = $1", car_id)
         deleted = int(res.split()[-1]) if res.startswith("DELETE") else 0
         await conn.execute("DELETE FROM cars WHERE id = $1", car_id)
@@ -464,7 +463,7 @@ async def cmd_cars(message: Message):
     lines = ["🏎 <b>Машины в базе</b>\n"]
     for row in rows:
         best = format_time(row["best_ms"]) if row["best_ms"] else "—"
-        lines.append(f"• <b>{row['name_original']}</b> — {row['count']} рез., лучшее: {best}")
+        lines.append(f"• <b>{row['name_original']}</b>\n  {row['count']} рез., лучшее: {best}\n")
 
     await message.answer("\n".join(lines), parse_mode="HTML")
 
