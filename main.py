@@ -128,7 +128,6 @@ async def init_db():
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
-        # На случай если таблица уже была без новых полей
         await conn.execute("ALTER TABLE cars ADD COLUMN IF NOT EXISTS photo_file_id TEXT")
         await conn.execute("ALTER TABLE cars ADD COLUMN IF NOT EXISTS power_hp INTEGER")
         await conn.execute("ALTER TABLE cars ADD COLUMN IF NOT EXISTS torque_nm INTEGER")
@@ -270,6 +269,7 @@ async def update_car_info(car_id: int, photo_file_id=None, power_hp=None, torque
 
 
 async def delete_result(result_id: int, user_id: int | None = None) -> bool:
+    """Удаляет результат. Если user_id указан — только свой."""
     async with pool.acquire() as conn:
         if user_id is not None:
             result = await conn.execute(
@@ -466,31 +466,97 @@ async def cmd_my(message: Message):
         await message.answer("У тебя пока нет результатов. Добавь первый — нажми «➕ Добавить результат»")
         return
 
-    lines = ["📋 <b>Твои результаты</b>\nНажми кнопку, чтобы удалить:\n"]
-    buttons = []
+    lines = ["📋 <b>Твои результаты</b>\n"]
     for i, row in enumerate(rows, 1):
         lines.append(f"{i}. <b>{row['time_display']}</b> — {row['car']}")
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"🗑 Удалить {row['time_display']} ({row['car']})",
-                callback_data=f"del_my:{row['id']}"
-            )
-        ])
+
+    # Одна кнопка вместо длинного списка
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить результат", callback_data="show_delete_list")]
+    ])
 
     await message.answer(
         "\n".join(lines),
         parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(F.data == "show_delete_list")
+async def show_delete_list(callback: CallbackQuery):
+    rows = await get_user_results(callback.from_user.id)
+    if not rows:
+        await callback.answer("Нет результатов для удаления", show_alert=True)
+        return
+
+    buttons = []
+    for row in rows:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🗑 {row['time_display']} — {row['car']}",
+                callback_data=f"del_my:{row['id']}"
+            )
+        ])
+    buttons.append([InlineKeyboardButton(text="« Назад", callback_data="back_to_my")])
+
+    await callback.message.edit_text(
+        "Выбери результат, который хочешь удалить:\n(можно удалить только свои)",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "back_to_my")
+async def back_to_my(callback: CallbackQuery):
+    rows = await get_user_results(callback.from_user.id)
+    if not rows:
+        await callback.message.edit_text("У тебя больше нет результатов.")
+        await callback.answer()
+        return
+
+    lines = ["📋 <b>Твои результаты</b>\n"]
+    for i, row in enumerate(rows, 1):
+        lines.append(f"{i}. <b>{row['time_display']}</b> — {row['car']}")
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить результат", callback_data="show_delete_list")]
+    ])
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("del_my:"))
 async def delete_my_result(callback: CallbackQuery):
     result_id = int(callback.data.split(":")[1])
+    # Строгая проверка: удаляем только результат текущего пользователя
     deleted = await delete_result(result_id, user_id=callback.from_user.id)
     if deleted:
-        await callback.message.edit_text("✅ Результат удалён.")
-        await callback.answer("Удалено")
+        await callback.answer("✅ Удалено")
+        # После удаления сразу показываем обновлённый список на удаление
+        rows = await get_user_results(callback.from_user.id)
+        if not rows:
+            await callback.message.edit_text("Все твои результаты удалены.")
+            return
+
+        buttons = []
+        for row in rows:
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"🗑 {row['time_display']} — {row['car']}",
+                    callback_data=f"del_my:{row['id']}"
+                )
+            ])
+        buttons.append([InlineKeyboardButton(text="« Назад", callback_data="back_to_my")])
+
+        await callback.message.edit_text(
+            "Выбери результат, который хочешь удалить:\n(можно удалить только свои)",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
     else:
         await callback.answer("Не удалось удалить (уже удалён или не твой)", show_alert=True)
 
@@ -603,7 +669,7 @@ async def editcar_selected(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(EditCar.waiting_photo, F.photo)
 async def editcar_photo(message: Message, state: FSMContext):
-    photo = message.photo[-1]  # самое большое
+    photo = message.photo[-1]
     data = await state.get_data()
     await update_car_info(data["edit_car_id"], photo_file_id=photo.file_id)
     await state.set_state(EditCar.waiting_power)
