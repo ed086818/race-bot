@@ -392,7 +392,7 @@ async def cmd_my(message: Message):
     for i, row in enumerate(rows, 1):
         lines.append(f"{i}. <b>{row['time_display']}</b> — {row['car']}")
 
-n    await message.answer("\n".join(lines), parse_mode="HTML")
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("cars"))
