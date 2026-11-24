@@ -32,11 +32,20 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise SystemExit("Не найден DATABASE_URL. Включите PostgreSQL в настройках Airlok.")
 
+# Админы (можно добавить через переменную ADMIN_IDS через запятую)
+ADMIN_IDS = {1170169366}
+if os.getenv("ADMIN_IDS"):
+    ADMIN_IDS.update(int(x.strip()) for x in os.getenv("ADMIN_IDS").split(",") if x.strip().isdigit())
+
 TRACK = "Nürburgring"
 pool: asyncpg.Pool | None = None
 
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 
 # ==================== Клавиатура ====================
@@ -86,7 +95,7 @@ def format_time(ms: int) -> str:
     return f"{seconds}.{millis:03d}"
 
 
-# ==================== База данных (PostgreSQL) ====================
+# ==================== База данных ====================
 async def init_db():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
@@ -212,12 +221,38 @@ async def get_user_results(user_id: int):
 async def get_all_cars():
     async with pool.acquire() as conn:
         return await conn.fetch("""
-            SELECT c.name_original, COUNT(r.id) as count, MIN(r.time_ms) as best_ms
+            SELECT c.id, c.name_original, COUNT(r.id) as count, MIN(r.time_ms) as best_ms
             FROM cars c
             LEFT JOIN results r ON r.car_id = c.id AND r.track = $1
             GROUP BY c.id, c.name_original
             ORDER BY count DESC, c.name_original
         """, TRACK)
+
+
+async def delete_result(result_id: int, user_id: int | None = None) -> bool:
+    """Удаляет результат. Если user_id указан — только свой."""
+    async with pool.acquire() as conn:
+        if user_id is not None:
+            result = await conn.execute(
+                "DELETE FROM results WHERE id = $1 AND user_id = $2",
+                result_id, user_id
+            )
+        else:
+            result = await conn.execute(
+                "DELETE FROM results WHERE id = $1",
+                result_id
+            )
+        return result == "DELETE 1"
+
+
+async def delete_car(car_id: int) -> int:
+    """Удаляет машину и все её результаты. Возвращает количество удалённых результатов."""
+    async with pool.acquire() as conn:
+        # Сначала удаляем результаты
+        res = await conn.execute("DELETE FROM results WHERE car_id = $1", car_id)
+        deleted = int(res.split()[-1]) if res.startswith("DELETE") else 0
+        await conn.execute("DELETE FROM cars WHERE id = $1", car_id)
+        return deleted
 
 
 # ==================== Хендлеры ====================
@@ -234,10 +269,12 @@ async def cmd_start(message: Message):
         "Используй кнопки внизу или команды:\n"
         "/add — добавить результат\n"
         "/top — общий рейтинг\n"
-        "/my — мои результаты\n"
+        "/my — мои результаты (можно удалять)\n"
         "/cars — список машин\n\n"
         "Формат времени: <code>1:23.456</code> или <code>83.456</code>"
     )
+    if is_admin(message.from_user.id):
+        text += "\n\n🔧 <b>Админ-команды:</b>\n/delcar — удалить машину\n/delresult — удалить результат по ID"
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 
@@ -374,7 +411,6 @@ async def cmd_top(message: Message):
     for i, row in enumerate(rows, 1):
         name = f"@{row['username']}" if row["username"] else row["full_name"]
         medal = medals.get(i, f"{i}.")
-        # Более заметное разделение между результатами
         lines.append(f"{medal} <b>{row['time_display']}</b> — {row['car']}\n👤 {name}\n")
 
     await message.answer("\n".join(lines), parse_mode="HTML")
@@ -388,11 +424,33 @@ async def cmd_my(message: Message):
         await message.answer("У тебя пока нет результатов. Добавь первый — нажми «➕ Добавить результат»")
         return
 
-    lines = ["📋 <b>Твои результаты</b>\n"]
+    lines = ["📋 <b>Твои результаты</b>\nНажми кнопку, чтобы удалить:\n"]
+    buttons = []
     for i, row in enumerate(rows, 1):
         lines.append(f"{i}. <b>{row['time_display']}</b> — {row['car']}")
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🗑 Удалить {row['time_display']} ({row['car']})",
+                callback_data=f"del_my:{row['id']}"
+            )
+        ])
 
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    await message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+@dp.callback_query(F.data.startswith("del_my:"))
+async def delete_my_result(callback: CallbackQuery):
+    result_id = int(callback.data.split(":")[1])
+    deleted = await delete_result(result_id, user_id=callback.from_user.id)
+    if deleted:
+        await callback.message.edit_text("✅ Результат удалён.")
+        await callback.answer("Удалено")
+    else:
+        await callback.answer("Не удалось удалить (уже удалён или не твой)", show_alert=True)
 
 
 @dp.message(Command("cars"))
@@ -409,6 +467,70 @@ async def cmd_cars(message: Message):
         lines.append(f"• <b>{row['name_original']}</b> — {row['count']} рез., лучшее: {best}")
 
     await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# ==================== Админ-команды ====================
+@dp.message(Command("delresult"))
+async def cmd_delresult(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только для администраторов.")
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip().isdigit():
+        await message.answer(
+            "Использование:\n<code>/delresult ID</code>\n\n"
+            "ID результата можно посмотреть в /my (у себя) или попросить пользователя.",
+            parse_mode="HTML"
+        )
+        return
+
+    result_id = int(args[1].strip())
+    deleted = await delete_result(result_id)
+    if deleted:
+        await message.answer(f"✅ Результат #{result_id} удалён.")
+    else:
+        await message.answer(f"❌ Результат #{result_id} не найден.")
+
+
+@dp.message(Command("delcar"))
+async def cmd_delcar(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только для администраторов.")
+        return
+
+    rows = await get_all_cars()
+    if not rows:
+        await message.answer("В базе нет машин.")
+        return
+
+    buttons = []
+    for row in rows:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🗑 {row['name_original']} ({row['count']} рез.)",
+                callback_data=f"admin_delcar:{row['id']}"
+            )
+        ])
+
+    await message.answer(
+        "Выбери машину для удаления:\n(удалятся все результаты этой машины)",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_delcar:"))
+async def admin_delete_car(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+
+    car_id = int(callback.data.split(":")[1])
+    deleted_count = await delete_car(car_id)
+    await callback.message.edit_text(
+        f"✅ Машина удалена.\nУдалено результатов: {deleted_count}"
+    )
+    await callback.answer("Удалено")
 
 
 # ==================== Health + Main ====================
