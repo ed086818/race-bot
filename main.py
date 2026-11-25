@@ -241,7 +241,7 @@ async def get_all_cars():
             FROM cars c
             LEFT JOIN results r ON r.car_id = c.id AND r.track = $1
             GROUP BY c.id, c.name_original
-            ORDER BY count DESC, c.name_original
+            ORDER BY best_ms ASC NULLS LAST, c.name_original
         """, TRACK)
 
 
@@ -442,7 +442,7 @@ async def process_time(message: Message, state: FSMContext):
 @dp.message(Command("top"))
 @dp.message(F.text == "🏆 Топ")
 async def cmd_top(message: Message):
-    rows = await get_top(20)
+    rows = await get_top(15)
     if not rows:
         await message.answer("Пока нет ни одного результата. Будь первым — нажми «➕ Добавить результат»")
         return
@@ -470,7 +470,6 @@ async def cmd_my(message: Message):
     for i, row in enumerate(rows, 1):
         lines.append(f"{i}. <b>{row['time_display']}</b> — {row['car']}")
 
-    # Одна кнопка вместо длинного списка
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗑 Удалить результат", callback_data="show_delete_list")]
     ])
@@ -531,13 +530,27 @@ async def back_to_my(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("del_my:"))
+async def confirm_delete_my_result(callback: CallbackQuery):
+    result_id = int(callback.data.split(":")[1])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_del:{result_id}"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="show_delete_list"),
+        ]
+    ])
+    await callback.message.edit_text(
+        "Точно удалить этот результат?",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("confirm_del:"))
 async def delete_my_result(callback: CallbackQuery):
     result_id = int(callback.data.split(":")[1])
-    # Строгая проверка: удаляем только результат текущего пользователя
     deleted = await delete_result(result_id, user_id=callback.from_user.id)
     if deleted:
         await callback.answer("✅ Удалено")
-        # После удаления сразу показываем обновлённый список на удаление
         rows = await get_user_results(callback.from_user.id)
         if not rows:
             await callback.message.edit_text("Все твои результаты удалены.")
@@ -574,7 +587,6 @@ async def cmd_cars(message: Message):
         best = format_time(row["best_ms"]) if row["best_ms"] else "—"
         lines.append(f"• <b>{row['name_original']}</b>\n  {row['count']} рез., лучшее: {best}\n")
 
-    # Одна кнопка вместо длинного списка
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="ℹ️ Подробнее о машине", callback_data="show_cars_list")]
     ])
