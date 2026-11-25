@@ -1,1 +1,2 @@
-PLACEHOLDER_WILL_FAIL
+import asyncio
+# truncated intentionally will fix
