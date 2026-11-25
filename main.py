@@ -95,10 +95,16 @@ async def init_db():
         for col, typ in [("photo_file_id","TEXT"),("power_hp","INTEGER"),("torque_nm","INTEGER"),("transmission","TEXT"),("drivetrain","TEXT")]:
             await conn.execute(f"ALTER TABLE cars ADD COLUMN IF NOT EXISTS {col} {typ}")
         await conn.execute("""CREATE TABLE IF NOT EXISTS results (
-            id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(telegram_id),
-            car_id INTEGER NOT NULL REFERENCES cars(id), time_ms INTEGER NOT NULL, time_display TEXT time_display TEXT NOT NULL, track TEXT NOT NULL,
-            proof_file_id TEXT, proof_type TEXT,
-            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())""")
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(telegram_id),
+            car_id INTEGER NOT NULL REFERENCES cars(id),
+            time_ms INTEGER NOT NULL,
+            time_display TEXT NOT NULL,
+            track TEXT NOT NULL,
+            proof_file_id TEXT,
+            proof_type TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW())""")
         await conn.execute("ALTER TABLE results ADD COLUMN IF NOT EXISTS proof_file_id TEXT")
         await conn.execute("ALTER TABLE results ADD COLUMN IF NOT EXISTS proof_type TEXT")
     logger.info("PostgreSQL база инициализирована")
