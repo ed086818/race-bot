@@ -294,6 +294,18 @@ async def cmd_start(message: Message):
         text += "\n\n🔧 <b>Админ-команды:</b>\n/editcar — фото и характеристики\n/delcar — удалить машину\n/delresult — удалить результат по ID"
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
+@dp.message(Command("thread"))
+async def cmd_thread(message: Message):
+    """Временная команда: показать chat_id и id темы."""
+    chat_id = message.chat.id
+    thread_id = message.message_thread_id
+    text = (
+        f"<b>chat_id:</b> <code>{chat_id}</code>\n"
+        f"<b>thread_id:</b> <code>{thread_id if thread_id is not None else 'нет (общий чат / не тема)'}</code>\n\n"
+        "Напиши эту команду <b>внутри нужной темы</b> группы."
+    )
+    await message.answer(text, parse_mode="HTML")
+
 @dp.message(Command("add"))
 @dp.message(F.text == "➕ Добавить результат")
 async def cmd_add(message: Message, state: FSMContext):
