@@ -1,7 +1,10 @@
 import asyncio
 import logging
 import os
+import random
 import re
+from datetime import datetime, timedelta, time as dt_time
+from zoneinfo import ZoneInfo
 from aiohttp import web
 import asyncpg
 from rapidfuzz import fuzz, process
@@ -32,6 +35,23 @@ if os.getenv("ADMIN_IDS"):
     ADMIN_IDS.update(int(x.strip()) for x in os.getenv("ADMIN_IDS").split(",") if x.strip().isdigit())
 
 TRACK = "Nürburgring"
+
+# Ежедневная рассылка (15:00 МСК) в тему группы
+DAILY_CHAT_ID = -1004321825624
+DAILY_THREAD_ID = 2179
+DAILY_TZ = ZoneInfo("Europe/Moscow")
+DAILY_HOUR = 15
+DAILY_MINUTE = 0
+
+MOTIVATION_LINES = [
+    "Один чистый круг лучше десяти грязных.",
+    "Зелёный ад не прощает ошибок — но награждает точных.",
+    "Сегодняшний круг — завтрашний личный рекорд.",
+    "Не забудь записать результат в бота ⏱",
+    "Трасса ждёт. Пиши время в @Racer_cpm2_bot",
+    "Каждый круг — шаг к вершине рейтинга.",
+]
+
 pool = None
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -207,6 +227,74 @@ async def get_leader_time_ms():
         row = await conn.fetchrow("SELECT MIN(time_ms) as best FROM results WHERE track=$1", TRACK)
         return row["best"] if row else None
 
+async def get_daily_stats():
+    """Статистика за последние 24 часа."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT COUNT(*) as results_count,
+                      COUNT(DISTINCT user_id) as pilots_count,
+                      MIN(time_ms) as best_ms
+               FROM results
+               WHERE track = $1 AND created_at >= NOW() - INTERVAL '24 hours'""",
+            TRACK,
+        )
+        best = await conn.fetchrow(
+            """SELECT r.time_display, c.name_original as car, u.username, u.full_name
+               FROM results r
+               JOIN cars c ON c.id = r.car_id
+               JOIN users u ON u.telegram_id = r.user_id
+               WHERE r.track = $1 AND r.created_at >= NOW() - INTERVAL '24 hours'
+               ORDER BY r.time_ms ASC LIMIT 1""",
+            TRACK,
+        )
+        return row, best
+
+async def build_daily_message() -> str:
+    row, best = await get_daily_stats()
+    lines = [f"🏁 <b>Итоги суток — {TRACK}</b>\n"]
+    n = int(row["results_count"] or 0) if row else 0
+    pilots = int(row["pilots_count"] or 0) if row else 0
+    if n == 0:
+        lines.append("За последние 24 часа результатов пока нет.")
+        lines.append("\nБудь первым — добавь круг в @Racer_cpm2_bot ⏱")
+    else:
+        lines.append(f"• Результатов: <b>{n}</b>")
+        lines.append(f"• Пилотов: <b>{pilots}</b>")
+        if best:
+            name = f"@{best['username']}" if best["username"] else best["full_name"]
+            lines.append(f"• Лучшее: <b>{best['time_display']}</b> — {best['car']}")
+            lines.append(f"  👤 {name}")
+        lines.append("")
+        lines.append(random.choice(MOTIVATION_LINES))
+        lines.append("\nЗапиши свой круг в @Racer_cpm2_bot")
+    return "\n".join(lines)
+
+async def send_daily_digest(bot: Bot):
+    text = await build_daily_message()
+    try:
+        await bot.send_message(
+            chat_id=DAILY_CHAT_ID,
+            text=text,
+            parse_mode="HTML",
+            message_thread_id=DAILY_THREAD_ID,
+        )
+        logger.info("Ежедневная рассылка отправлена в тему %s", DAILY_THREAD_ID)
+    except Exception as e:
+        logger.error("Ошибка ежедневной рассылки: %s", e)
+
+async def daily_broadcast_loop(bot: Bot):
+    """Ждёт 15:00 МСК и отправляет дайджест."""
+    while True:
+        now = datetime.now(DAILY_TZ)
+        target = now.replace(hour=DAILY_HOUR, minute=DAILY_MINUTE, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        wait_sec = (target - now).total_seconds()
+        logger.info("Следующая рассылка через %.0f сек (%s МСК)", wait_sec, target.strftime("%Y-%m-%d %H:%M"))
+        await asyncio.sleep(wait_sec)
+        await send_daily_digest(bot)
+        await asyncio.sleep(60)
+
 async def get_community_stats():
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -291,7 +379,7 @@ async def cmd_start(message: Message):
         "Формат времени: <code>1:23.456</code> или <code>83.456</code>"
     )
     if is_admin(message.from_user.id):
-        text += "\n\n🔧 <b>Админ-команды:</b>\n/editcar — фото и характеристики\n/delcar — удалить машину\n/delresult — удалить результат по ID"
+        text += "\n\n🔧 <b>Админ-команды:</b>\n/editcar — фото и характеристики\n/delcar — удалить машину\n/delresult — удалить результат по ID\n/testdaily — тест ежедневной рассылки"
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 @dp.message(Command("thread"))
@@ -305,6 +393,15 @@ async def cmd_thread(message: Message):
         "Напиши эту команду <b>внутри нужной темы</b> группы."
     )
     await message.answer(text, parse_mode="HTML")
+
+@dp.message(Command("testdaily"))
+async def cmd_testdaily(message: Message, bot: Bot):
+    """Админ: сразу отправить дайджест в тему."""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только для админов.")
+        return
+    await send_daily_digest(bot)
+    await message.answer("✅ Тестовая рассылка отправлена в тему.")
 
 @dp.message(Command("add"))
 @dp.message(F.text == "➕ Добавить результат")
@@ -814,6 +911,8 @@ async def main():
         except Exception as e:
             logger.error("%s", e)
             await asyncio.sleep(15)
+    asyncio.create_task(daily_broadcast_loop(bot))
+    logger.info("Фоновая ежедневная рассылка запущена (15:00 МСК)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
